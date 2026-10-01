@@ -12,20 +12,28 @@
 pipeline {
     agent any
 
+    parameters {
+        string(name: 'ENVIRONMENT', defaultValue: 'dev', description: 'Environment (e.g. dev, prod)')
+        string(name: 'NAME_SUFFIX', defaultValue: 'hung', description: 'Name suffix matching infra pipeline')
+        string(name: 'ACR_NAME', defaultValue: '', description: 'Override ACR Name (empty = <ENVIRONMENT>regapp<NAME_SUFFIX>)')
+        string(name: 'AKS_RESOURCE_GROUP', defaultValue: '', description: 'Override AKS Resource Group (empty = <ENVIRONMENT>-register-app-rg)')
+        string(name: 'AKS_CLUSTER_NAME', defaultValue: '', description: 'Override AKS Cluster Name (empty = <ENVIRONMENT>-register-app-aks)')
+    }
+
     environment {
         APP_NAME           = "register-app-pipeline"
         RELEASE            = "1.0.0"
-        // --- Azure settings: change to match azure/infra/provision.sh output ---
-        ACR_NAME           = "registerappacr"
+        ENVIRONMENT_NAME   = "${params.ENVIRONMENT ?: 'dev'}"
+        SUFFIX             = "${params.NAME_SUFFIX ?: 'hung'}"
+        // Matches the Terraform azure/terraform output convention
+        ACR_NAME           = "${params.ACR_NAME?.trim() ? params.ACR_NAME : "${ENVIRONMENT_NAME}regapp${SUFFIX}"}"
         ACR_LOGIN_SERVER   = "${ACR_NAME}.azurecr.io"
-        AKS_RESOURCE_GROUP = "register-app-rg"
-        AKS_CLUSTER_NAME   = "register-app-aks"
+        AKS_RESOURCE_GROUP = "${params.AKS_RESOURCE_GROUP?.trim() ? params.AKS_RESOURCE_GROUP : "${ENVIRONMENT_NAME}-register-app-rg"}"
+        AKS_CLUSTER_NAME   = "${params.AKS_CLUSTER_NAME?.trim() ? params.AKS_CLUSTER_NAME : "${ENVIRONMENT_NAME}-register-app-aks"}"
         K8S_NAMESPACE      = "default"
         // ------------------------------------------------------------------------
         IMAGE_NAME         = "${ACR_LOGIN_SERVER}/${APP_NAME}"
         IMAGE_TAG          = "${RELEASE}-${BUILD_NUMBER}"
-        // Pin Trivy by tag + digest; never use aquasec/trivy:latest
-        // (latest was poisoned in the March 2026 supply-chain attack, GHSA-69fq-xp46-6x23).
         TRIVY_IMAGE        = "aquasec/trivy:0.74.0@sha256:62b1e65e8869bc4b4c6aa4fa2b21595256c7c2f6018a9d9ad61caf87187c1969"
         AZURE_CONFIG_DIR   = "${WORKSPACE}/.azure"
     }
