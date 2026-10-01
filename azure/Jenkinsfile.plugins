@@ -69,7 +69,7 @@ pipeline {
             steps {
                 // Plugin: SonarQube Scanner
                 withSonarQubeEnv('SonarQube') {
-                    sh "mvn -B -Pazure org.sonarsource.scanner.maven:sonar-maven-plugin:3.11.0.3922:sonar -Dsonar.projectKey=register-app -Dsonar.projectName=register-app"
+                    sh 'mvn -B -Pazure org.sonarsource.scanner.maven:sonar-maven-plugin:3.11.0.3922:sonar -Dsonar.projectKey=register-app -Dsonar.projectName=register-app -Dsonar.token="${SONAR_AUTH_TOKEN ?: SONAR_TOKEN}"'
                 }
             }
         }
@@ -145,15 +145,23 @@ pipeline {
     post {
         failure {
             // Plugin: Email Extension
-            emailext body: '''${SCRIPT, template="groovy-html.template"}''',
-                     subject: "${env.JOB_NAME} - Build # ${env.BUILD_NUMBER} - Failed",
-                     mimeType: 'text/html', to: "${NOTIFY_EMAIL}"
+            script {
+                catchError(buildResult: 'FAILURE', stageResult: 'UNSTABLE') {
+                    emailext body: 'Build failed. Check Jenkins console for details.',
+                             subject: "${env.JOB_NAME} - Build # ${env.BUILD_NUMBER} - Failed",
+                             to: "${NOTIFY_EMAIL}"
+                }
+            }
         }
         success {
             // Plugin: Email Extension
-            emailext body: '''${SCRIPT, template="groovy-html.template"}''',
-                     subject: "${env.JOB_NAME} - Build # ${env.BUILD_NUMBER} - Successful",
-                     mimeType: 'text/html', to: "${NOTIFY_EMAIL}"
+            script {
+                catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+                    emailext body: 'Build succeeded! Artifacts built and scanned.',
+                             subject: "${env.JOB_NAME} - Build # ${env.BUILD_NUMBER} - Successful",
+                             to: "${NOTIFY_EMAIL}"
+                }
+            }
         }
     }
 }
