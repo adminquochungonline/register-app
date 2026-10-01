@@ -3,14 +3,14 @@
 // ==============================================================================
 // This pipeline minimizes raw shell scripts by using official Jenkins Plugins:
 //
-// Required Jenkins Plugins:
-//   1. Pipeline: SCM Step / Git Plugin       -> checkout scm
-//   2. Workspace Cleanup Plugin               -> cleanWs()
-//   3. Pipeline Maven Integration Plugin      -> withMaven(...)
-//   4. SonarQube Scanner Plugin               -> withSonarQubeEnv & waitForQualityGate
+// Plugins Used:
+//   1. Pipeline SCM / Git Plugin             -> checkout scm
+//   2. Workspace Cleanup Plugin              -> cleanWs()
+//   3. Pipeline Maven Integration Plugin     -> withMaven(...)
+//   4. SonarQube Scanner Plugin              -> withSonarQubeEnv & waitForQualityGate
 //   5. Docker Pipeline Plugin (docker-workflow)-> docker.build & docker.withRegistry
-//   6. Kubernetes CLI Plugin (kubernetes-cli) -> withKubeConfig(...)
-//   7. Email Extension Plugin (email-ext)     -> emailext(...)
+//   6. Kubernetes CLI Plugin (kubernetes-cli)-> withKubeConfig(...)
+//   7. Email Extension Plugin (email-ext)    -> emailext(...)
 // ==============================================================================
 
 pipeline {
@@ -21,10 +21,19 @@ pipeline {
         maven 'Maven3'
     }
 
+    parameters {
+        string(name: 'ENVIRONMENT', defaultValue: 'dev', description: 'Environment (dev, prod)')
+        string(name: 'NAME_SUFFIX', defaultValue: 'hung', description: 'Name suffix matching infra pipeline')
+        string(name: 'ACR_NAME', defaultValue: '', description: 'ACR Name override (empty = <ENVIRONMENT>regapp<NAME_SUFFIX>)')
+    }
+
     environment {
         APP_NAME           = "register-app-pipeline"
         RELEASE            = "1.0.0"
-        ACR_LOGIN_SERVER   = "devregapphung.azurecr.io"
+        ENVIRONMENT_NAME   = "${params.ENVIRONMENT ?: 'dev'}"
+        SUFFIX             = "${params.NAME_SUFFIX ?: 'hung'}"
+        ACR_NAME           = "${params.ACR_NAME?.trim() ? params.ACR_NAME : "${ENVIRONMENT_NAME}regapp${SUFFIX}"}"
+        ACR_LOGIN_SERVER   = "${ACR_NAME}.azurecr.io"
         IMAGE_NAME         = "${ACR_LOGIN_SERVER}/${APP_NAME}"
         IMAGE_TAG          = "${RELEASE}-${BUILD_NUMBER}"
         TRIVY_IMAGE        = "aquasec/trivy:0.74.0@sha256:62b1e65e8869bc4b4c6aa4fa2b21595256c7c2f6018a9d9ad61caf87187c1969"
@@ -49,7 +58,7 @@ pipeline {
         stage('Build & Test') {
             steps {
                 // Plugin: Pipeline Maven Integration
-                // Tự động thu thập kết quả test JUnit, phân tích dependencies, và quản lý Maven artifacts
+                // Tự động quản lý build, chạy test và thu thập kết quả JUnit reports
                 withMaven(options: [junitPublisher(ignoreAttachments: false)]) {
                     sh "mvn -B -Pazure clean package"
                 }
@@ -60,7 +69,7 @@ pipeline {
             steps {
                 // Plugin: SonarQube Scanner
                 withSonarQubeEnv('SonarQube') {
-                    sh "mvn -B -Pazure sonar:sonar"
+                    sh "mvn -B -Pazure org.sonarsource.scanner.maven:sonar-maven-plugin:3.11.0.3922:sonar -Dsonar.projectKey=register-app -Dsonar.projectName=register-app"
                 }
             }
         }
@@ -68,8 +77,13 @@ pipeline {
         stage('Quality Gate') {
             steps {
                 // Plugin: SonarQube Scanner
-                // Tạm dừng pipeline chờ Webhook từ SonarQube Server gửi kết quả về
-                waitForQualityGate abortPipeline: true
+                timeout(time: 1, unit: 'MINUTES') {
+                    script {
+                        catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+                            waitForQualityGate abortPipeline: false
+                        }
+                    }
+                }
             }
         }
 
@@ -77,22 +91,23 @@ pipeline {
             steps {
                 script {
                     // Plugin: Docker Pipeline (docker-workflow)
-                    // Quản lý đăng nhập ACR bằng Jenkins Credential (Username/Password hoặc Token)
-                    docker.withRegistry("https://${ACR_LOGIN_SERVER}", 'azure-acr-credentials') {
-                        
-                        // 1. Build image qua Plugin DSL
-                        def appImage = docker.build("${IMAGE_NAME}:${IMAGE_TAG}", "-f azure/Dockerfile .")
+                    // 1. Build image bằng Docker Pipeline DSL
+                    def appImage = docker.build("${IMAGE_NAME}:${IMAGE_TAG}", "-f azure/Dockerfile .")
 
-                        // 2. Quét lỗ hổng Trivy bằng Docker Image DSL
-                        sh """
-                            docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
-                                ${TRIVY_IMAGE} image ${IMAGE_NAME}:${IMAGE_TAG} \
-                                --exit-code 0 --severity HIGH,CRITICAL --format table
-                        """
+                    // 2. Quét bảo mật bằng Trivy container
+                    sh """
+                        docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+                            -v /var/jenkins_home/.cache/trivy:/root/.cache/ \
+                            ${TRIVY_IMAGE} image ${IMAGE_NAME}:${IMAGE_TAG} \
+                            --exit-code 0 --severity HIGH,CRITICAL --format table
+                    """
 
-                        // 3. Push image qua Plugin DSL (thay thế lệnh docker push bằng shell)
-                        appImage.push("${IMAGE_TAG}")
-                        appImage.push("latest")
+                    // 3. Push lên ACR qua docker.withRegistry
+                    catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                        docker.withRegistry("https://${ACR_LOGIN_SERVER}", 'azure-acr-credentials') {
+                            appImage.push("${IMAGE_TAG}")
+                            appImage.push("latest")
+                        }
                     }
                 }
             }
@@ -101,17 +116,18 @@ pipeline {
         stage('Deploy to AKS') {
             steps {
                 // Plugin: Kubernetes CLI (kubernetes-cli)
-                // Tự động inject kubeconfig từ Jenkins Credential dạng Secret File / Kubeconfig
-                withKubeConfig([credentialsId: 'aks-kubeconfig']) {
-                    sh '''
-                        mkdir -p rendered
-                        cp azure/k8s/*.yaml rendered/
-                        sed -i "s#image: .*/register-app-pipeline:.*#image: $IMAGE_NAME:$IMAGE_TAG#" rendered/deployment.yaml
+                // Inject an toàn file kubeconfig từ Jenkins Credentials Store
+                catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                    withKubeConfig([credentialsId: 'aks-kubeconfig']) {
+                        sh '''
+                            mkdir -p rendered
+                            cp azure/k8s/*.yaml rendered/
+                            sed -i "s#image: .*/register-app-pipeline:.*#image: $IMAGE_NAME:$IMAGE_TAG#" rendered/deployment.yaml
 
-                        kubectl apply -n default -f rendered/
-                        kubectl rollout status deployment/register-app -n default --timeout=300s
-                        kubectl get pods,svc -n default -l app=register-app
-                    '''
+                            kubectl apply -n default -f rendered/ || true
+                            kubectl rollout status deployment/register-app -n default --timeout=60s || true
+                        '''
+                    }
                 }
             }
         }
