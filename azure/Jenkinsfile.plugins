@@ -69,13 +69,14 @@ pipeline {
             steps {
                 // Plugin: SonarQube Scanner
                 withSonarQubeEnv('SonarQube') {
-                    sh '''
-                        TOKEN="${SONAR_AUTH_TOKEN:-$SONAR_TOKEN}"
-                        mvn -B -Pazure org.sonarsource.scanner.maven:sonar-maven-plugin:3.11.0.3922:sonar \
-                            -Dsonar.projectKey=register-app \
-                            -Dsonar.projectName=register-app \
-                            -Dsonar.token="$TOKEN"
-                    '''
+                    withCredentials([string(credentialsId: 'sonarqube-token', variable: 'SONAR_TOKEN')]) {
+                        sh '''
+                            mvn -B -Pazure org.sonarsource.scanner.maven:sonar-maven-plugin:3.11.0.3922:sonar \
+                                -Dsonar.projectKey=register-app \
+                                -Dsonar.projectName=register-app \
+                                -Dsonar.token="$SONAR_TOKEN"
+                        '''
+                    }
                 }
             }
         }
