@@ -1,0 +1,143 @@
+// ==============================================================================
+// Azure edition of register-app CI/CD pipeline using MAXIMUM JENKINS PLUGINS
+// ==============================================================================
+// This pipeline minimizes raw shell scripts by using official Jenkins Plugins:
+//
+// Required Jenkins Plugins:
+//   1. Pipeline: SCM Step / Git Plugin       -> checkout scm
+//   2. Workspace Cleanup Plugin               -> cleanWs()
+//   3. Pipeline Maven Integration Plugin      -> withMaven(...)
+//   4. SonarQube Scanner Plugin               -> withSonarQubeEnv & waitForQualityGate
+//   5. Docker Pipeline Plugin (docker-workflow)-> docker.build & docker.withRegistry
+//   6. Kubernetes CLI Plugin (kubernetes-cli) -> withKubeConfig(...)
+//   7. Email Extension Plugin (email-ext)     -> emailext(...)
+// ==============================================================================
+
+pipeline {
+    agent any
+
+    tools {
+        jdk 'Java17'
+        maven 'Maven3'
+    }
+
+    environment {
+        APP_NAME           = "register-app-pipeline"
+        RELEASE            = "1.0.0"
+        ACR_LOGIN_SERVER   = "devregapphung.azurecr.io"
+        IMAGE_NAME         = "${ACR_LOGIN_SERVER}/${APP_NAME}"
+        IMAGE_TAG          = "${RELEASE}-${BUILD_NUMBER}"
+        TRIVY_IMAGE        = "aquasec/trivy:0.74.0@sha256:62b1e65e8869bc4b4c6aa4fa2b21595256c7c2f6018a9d9ad61caf87187c1969"
+        NOTIFY_EMAIL       = "admin@quochung.online"
+    }
+
+    stages {
+        stage('Cleanup Workspace') {
+            steps {
+                // Plugin: Workspace Cleanup
+                cleanWs()
+            }
+        }
+
+        stage('Checkout SCM') {
+            steps {
+                // Plugin: Git / Pipeline SCM
+                checkout scm
+            }
+        }
+
+        stage('Build & Test') {
+            steps {
+                // Plugin: Pipeline Maven Integration
+                // Tự động thu thập kết quả test JUnit, phân tích dependencies, và quản lý Maven artifacts
+                withMaven(options: [junitPublisher(ignoreAttachments: false)]) {
+                    sh "mvn -B -Pazure clean package"
+                }
+            }
+        }
+
+        stage('SonarQube Analysis') {
+            steps {
+                // Plugin: SonarQube Scanner
+                withSonarQubeEnv('SonarQube') {
+                    sh "mvn -B -Pazure sonar:sonar"
+                }
+            }
+        }
+
+        stage('Quality Gate') {
+            steps {
+                // Plugin: SonarQube Scanner
+                // Tạm dừng pipeline chờ Webhook từ SonarQube Server gửi kết quả về
+                waitForQualityGate abortPipeline: true
+            }
+        }
+
+        stage('Docker Build, Scan & Push (ACR)') {
+            steps {
+                script {
+                    // Plugin: Docker Pipeline (docker-workflow)
+                    // Quản lý đăng nhập ACR bằng Jenkins Credential (Username/Password hoặc Token)
+                    docker.withRegistry("https://${ACR_LOGIN_SERVER}", 'azure-acr-credentials') {
+                        
+                        // 1. Build image qua Plugin DSL
+                        def appImage = docker.build("${IMAGE_NAME}:${IMAGE_TAG}", "-f azure/Dockerfile .")
+
+                        // 2. Quét lỗ hổng Trivy bằng Docker Image DSL
+                        sh """
+                            docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+                                ${TRIVY_IMAGE} image ${IMAGE_NAME}:${IMAGE_TAG} \
+                                --exit-code 0 --severity HIGH,CRITICAL --format table
+                        """
+
+                        // 3. Push image qua Plugin DSL (thay thế lệnh docker push bằng shell)
+                        appImage.push("${IMAGE_TAG}")
+                        appImage.push("latest")
+                    }
+                }
+            }
+        }
+
+        stage('Deploy to AKS') {
+            steps {
+                // Plugin: Kubernetes CLI (kubernetes-cli)
+                // Tự động inject kubeconfig từ Jenkins Credential dạng Secret File / Kubeconfig
+                withKubeConfig([credentialsId: 'aks-kubeconfig']) {
+                    sh '''
+                        mkdir -p rendered
+                        cp azure/k8s/*.yaml rendered/
+                        sed -i "s#image: .*/register-app-pipeline:.*#image: $IMAGE_NAME:$IMAGE_TAG#" rendered/deployment.yaml
+
+                        kubectl apply -n default -f rendered/
+                        kubectl rollout status deployment/register-app -n default --timeout=300s
+                        kubectl get pods,svc -n default -l app=register-app
+                    '''
+                }
+            }
+        }
+
+        stage('Cleanup Local Images') {
+            steps {
+                sh '''
+                    docker rmi "$IMAGE_NAME:$IMAGE_TAG" || true
+                    docker rmi "$IMAGE_NAME:latest" || true
+                '''
+            }
+        }
+    }
+
+    post {
+        failure {
+            // Plugin: Email Extension
+            emailext body: '''${SCRIPT, template="groovy-html.template"}''',
+                     subject: "${env.JOB_NAME} - Build # ${env.BUILD_NUMBER} - Failed",
+                     mimeType: 'text/html', to: "${NOTIFY_EMAIL}"
+        }
+        success {
+            // Plugin: Email Extension
+            emailext body: '''${SCRIPT, template="groovy-html.template"}''',
+                     subject: "${env.JOB_NAME} - Build # ${env.BUILD_NUMBER} - Successful",
+                     mimeType: 'text/html', to: "${NOTIFY_EMAIL}"
+        }
+    }
+}
