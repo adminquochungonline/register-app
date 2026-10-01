@@ -1,0 +1,103 @@
+# Azure DevOps edition of the register-app CI/CD pipeline (alternative to azure/Jenkinsfile).
+#
+# Setup in Azure DevOps (Project settings > Service connections):
+#   - Docker Registry  -> Azure Container Registry  (name: acr-connection)
+#   - Kubernetes       -> Azure Subscription / AKS  (name: aks-connection)
+# Then create a pipeline from "Existing Azure Pipelines YAML file" -> /azure/azure-pipelines.yml
+#
+# SonarQube: install the "SonarQube" marketplace extension and add the
+# SonarQubePrepare@7 / SonarQubeAnalyze@7 tasks around the Maven step if needed.
+
+trigger:
+  branches:
+    include:
+      - main
+
+variables:
+  dockerRegistryServiceConnection: 'acr-connection'
+  kubernetesServiceConnection: 'aks-connection'
+  acrLoginServer: 'registerappacr.azurecr.io'   # must match the ACR behind acr-connection
+  imageRepository: 'register-app-pipeline'
+  release: '1.0.0'
+  tag: '$(release)-$(Build.BuildId)'
+  k8sNamespace: 'default'
+  # Pin Trivy by tag + digest; never use aquasec/trivy:latest (GHSA-69fq-xp46-6x23).
+  trivyImage: 'aquasec/trivy:0.74.0@sha256:62b1e65e8869bc4b4c6aa4fa2b21595256c7c2f6018a9d9ad61caf87187c1969'
+
+stages:
+  - stage: Build
+    displayName: Build, test, scan and push
+    jobs:
+      - job: Build
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - task: Maven@4
+            displayName: Maven build & unit tests
+            inputs:
+              mavenPomFile: 'pom.xml'
+              goals: 'clean package'
+              options: '-B -Pazure'
+              javaHomeOption: 'JDKVersion'
+              jdkVersionOption: '1.17'
+              publishJUnitResults: true
+              testResultsFiles: '**/surefire-reports/TEST-*.xml'
+
+          - task: Docker@2
+            displayName: Build Docker image
+            inputs:
+              command: build
+              containerRegistry: $(dockerRegistryServiceConnection)
+              repository: $(imageRepository)
+              Dockerfile: 'azure/Dockerfile'
+              buildContext: '$(Build.SourcesDirectory)'
+              tags: |
+                $(tag)
+                latest
+
+          # Scan before push so a vulnerable image never reaches ACR
+          # (set --exit-code 1 to fail the build on HIGH/CRITICAL findings).
+          - script: |
+              docker run --rm -v /var/run/docker.sock:/var/run/docker.sock "$(trivyImage)" \
+                image "$(acrLoginServer)/$(imageRepository):$(tag)" \
+                --no-progress --scanners vuln --exit-code 0 --severity HIGH,CRITICAL --format table
+            displayName: Trivy scan
+
+          - task: Docker@2
+            displayName: Push image to ACR
+            inputs:
+              command: push
+              containerRegistry: $(dockerRegistryServiceConnection)
+              repository: $(imageRepository)
+              tags: |
+                $(tag)
+                latest
+
+  - stage: Deploy
+    displayName: Deploy to AKS
+    dependsOn: Build
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    jobs:
+      - deployment: DeployAKS
+        pool:
+          vmImage: ubuntu-latest
+        environment: 'register-app-aks'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                # Deployment jobs do not check out sources automatically.
+                - checkout: self
+
+                - task: KubernetesManifest@1
+                  displayName: Apply manifests
+                  inputs:
+                    action: deploy
+                    connectionType: kubernetesServiceConnection
+                    kubernetesServiceConnection: $(kubernetesServiceConnection)
+                    namespace: $(k8sNamespace)
+                    manifests: |
+                      azure/k8s/deployment.yaml
+                      azure/k8s/service.yaml
+                    # Replaces the image in deployment.yaml with the tag built above.
+                    containers: '$(acrLoginServer)/$(imageRepository):$(tag)'

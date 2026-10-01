@@ -1,0 +1,50 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: register-app
+  labels:
+    app: register-app
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: register-app
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: register-app
+    spec:
+      containers:
+        - name: register-app
+          # The tag is replaced at deploy time by azure/Jenkinsfile (sed)
+          # or azure/azure-pipelines.yml (KubernetesManifest "containers" input).
+          # AKS pulls from ACR via the kubelet identity's AcrPull role (no imagePullSecret).
+          image: registerappacr.azurecr.io/register-app-pipeline:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          readinessProbe:
+            httpGet:
+              path: /webapp/
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /webapp/
+              port: http
+            initialDelaySeconds: 60
+            periodSeconds: 20

@@ -20,6 +20,8 @@ By the end of this project, you'll have a fully automated **CI/CD pipeline** tha
 ✅ **Deploys to Kubernetes** on AWS EKS  
 ✅ **Monitors deployments** automatically  
 
+> ☁️ **Azure version:** an Azure edition of this pipeline (ACR + AKS, Bicep infrastructure, Jenkins and Azure DevOps pipelines) lives in [`azure/`](azure/README.md).
+
 ---
 
 ## 🎯 **Project Goals**

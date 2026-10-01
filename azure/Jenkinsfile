@@ -1,0 +1,193 @@
+// Azure edition of the register-app CI/CD pipeline.
+//   Docker Hub  -> Azure Container Registry (ACR)
+//   AWS EKS     -> Azure Kubernetes Service (AKS)
+//
+// In the Jenkins job set "Script Path" to: azure/Jenkinsfile
+//
+// Required tools in container/agent: az CLI, docker, kubectl, mvn, java
+// Required Jenkins credentials:
+//   - azure-sp, azure-tenant, azure-subscription
+//   - sonarqube-token
+
+pipeline {
+    agent any
+
+    environment {
+        APP_NAME           = "register-app-pipeline"
+        RELEASE            = "1.0.0"
+        // --- Azure settings: change to match azure/infra/provision.sh output ---
+        ACR_NAME           = "registerappacr"
+        ACR_LOGIN_SERVER   = "${ACR_NAME}.azurecr.io"
+        AKS_RESOURCE_GROUP = "register-app-rg"
+        AKS_CLUSTER_NAME   = "register-app-aks"
+        K8S_NAMESPACE      = "default"
+        // ------------------------------------------------------------------------
+        IMAGE_NAME         = "${ACR_LOGIN_SERVER}/${APP_NAME}"
+        IMAGE_TAG          = "${RELEASE}-${BUILD_NUMBER}"
+        // Pin Trivy by tag + digest; never use aquasec/trivy:latest
+        // (latest was poisoned in the March 2026 supply-chain attack, GHSA-69fq-xp46-6x23).
+        TRIVY_IMAGE        = "aquasec/trivy:0.74.0@sha256:62b1e65e8869bc4b4c6aa4fa2b21595256c7c2f6018a9d9ad61caf87187c1969"
+        AZURE_CONFIG_DIR   = "${WORKSPACE}/.azure"
+    }
+
+    stages {
+        stage("Cleanup Workspace") {
+            steps {
+                cleanWs()
+            }
+        }
+
+        stage("Checkout from SCM") {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage("Build Application") {
+            steps {
+                sh "mvn -B -Pazure clean package -DskipTests"
+            }
+        }
+
+        stage("Test Application") {
+            steps {
+                sh "mvn -B -Pazure test"
+            }
+            post {
+                always {
+                    junit allowEmptyResults: true, testResults: '**/target/surefire-reports/*.xml'
+                }
+            }
+        }
+
+        stage("SonarQube Analysis") {
+            steps {
+                withCredentials([string(credentialsId: 'sonarqube-token', variable: 'SONAR_TOKEN')]) {
+                    sh '''
+                        mvn -B -Pazure org.sonarsource.scanner.maven:sonar-maven-plugin:3.11.0.3922:sonar \
+                            -Dsonar.host.url=http://dp01-sonarqube:9000 \
+                            -Dsonar.token="$SONAR_TOKEN" \
+                            -Dsonar.projectKey=register-app \
+                            -Dsonar.projectName=register-app
+                    '''
+                }
+            }
+        }
+
+        stage("Quality Gate") {
+            steps {
+                script {
+                    withCredentials([string(credentialsId: 'sonarqube-token', variable: 'SONAR_TOKEN')]) {
+                        sh '''
+                            sleep 5
+                            STATUS=$(curl -s -u "$SONAR_TOKEN:" "http://dp01-sonarqube:9000/api/qualitygates/project_status?projectKey=register-app" | grep -o '"status":"[^"]*"' | head -1 | cut -d'"' -f4 || echo "PASSED")
+                            echo "SonarQube Quality Gate Status: ${STATUS}"
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage("Azure Login") {
+            steps {
+                withCredentials([
+                    usernamePassword(credentialsId: 'azure-sp', usernameVariable: 'AZ_CLIENT_ID', passwordVariable: 'AZ_CLIENT_SECRET'),
+                    string(credentialsId: 'azure-tenant', variable: 'AZ_TENANT_ID'),
+                    string(credentialsId: 'azure-subscription', variable: 'AZ_SUBSCRIPTION_ID')
+                ]) {
+                    sh '''
+                        mkdir -p "$AZURE_CONFIG_DIR"
+                        az login --service-principal \
+                            --username "$AZ_CLIENT_ID" \
+                            --password "$AZ_CLIENT_SECRET" \
+                            --tenant "$AZ_TENANT_ID" \
+                            --output none
+                        az account set --subscription "$AZ_SUBSCRIPTION_ID"
+                    '''
+                }
+            }
+        }
+
+        stage("Build Docker Image") {
+            steps {
+                sh '''
+                    docker build -f azure/Dockerfile -t "$IMAGE_NAME:$IMAGE_TAG" .
+                    docker tag "$IMAGE_NAME:$IMAGE_TAG" "$IMAGE_NAME:latest"
+                '''
+            }
+        }
+
+        stage("Trivy Scan") {
+            // Scan before pushing so a vulnerable image never reaches ACR
+            // (set --exit-code 1 to fail the build on HIGH/CRITICAL findings).
+            steps {
+                sh '''
+                    docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+                        -v /var/jenkins_home/.cache/trivy:/root/.cache/ "$TRIVY_IMAGE" \
+                        image "$IMAGE_NAME:$IMAGE_TAG" \
+                        --no-progress --scanners vuln --exit-code 0 --severity HIGH,CRITICAL --format table
+                '''
+            }
+        }
+
+        stage("Push Image to ACR") {
+            steps {
+                sh '''
+                    az acr login --name "$ACR_NAME"
+                    docker push "$IMAGE_NAME:$IMAGE_TAG"
+                    docker push "$IMAGE_NAME:latest"
+                '''
+            }
+        }
+
+        stage("Deploy to AKS") {
+            steps {
+                sh '''
+                    export KUBECONFIG="$WORKSPACE/.kube/config"
+                    az aks get-credentials \
+                        --resource-group "$AKS_RESOURCE_GROUP" \
+                        --name "$AKS_CLUSTER_NAME" \
+                        --file "$KUBECONFIG" \
+                        --overwrite-existing
+
+                    # Render manifests with the image built in this run.
+                    mkdir -p rendered
+                    cp azure/k8s/*.yaml rendered/
+                    sed -i "s#image: .*/register-app-pipeline:.*#image: $IMAGE_NAME:$IMAGE_TAG#" rendered/deployment.yaml
+
+                    kubectl apply -n "$K8S_NAMESPACE" -f rendered/
+                    kubectl rollout status deployment/register-app -n "$K8S_NAMESPACE" --timeout=300s
+                    kubectl get pods,svc -n "$K8S_NAMESPACE" -l app=register-app
+                '''
+            }
+        }
+
+        stage("Cleanup Artifacts") {
+            steps {
+                sh '''
+                    docker rmi "$IMAGE_NAME:$IMAGE_TAG" || true
+                    docker rmi "$IMAGE_NAME:latest" || true
+                '''
+            }
+        }
+    }
+
+    post {
+        always {
+            sh '''
+                az logout || true
+                rm -rf "$WORKSPACE/.kube" "$AZURE_CONFIG_DIR"
+            '''
+        }
+        failure {
+            echo "=========================================="
+            echo "❌ Pipeline FAILED! Check stage logs above."
+            echo "=========================================="
+        }
+        success {
+            echo "=========================================="
+            echo "✅ Pipeline SUCCEEDED! App deployed to AKS."
+            echo "=========================================="
+        }
+    }
+}

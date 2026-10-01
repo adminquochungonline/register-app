@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: register-app-service
+  labels:
+    app: register-app
+spec:
+  # AKS provisions a public Azure Load Balancer IP for this Service.
+  type: LoadBalancer
+  selector:
+    app: register-app
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
